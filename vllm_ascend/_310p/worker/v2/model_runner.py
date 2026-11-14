@@ -52,6 +52,7 @@ from vllm_ascend._310p.worker.v2.spec_utils import (
     set_prefill_host_meta,
 )
 from vllm_ascend._310p.worker.v2.states import Ascend310PRequestState
+from vllm_ascend._310p.worker.v2.structured_outputs import apply_grammar_bitmask
 from vllm_ascend.core.kv_cache_interface import get_storage_block_size
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, get_kv_cache_tensor_layers, shared_experts_calculation_stream
@@ -412,7 +413,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
-            is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
+            is_padding=self.prepare_padding_mask(num_tokens, num_tokens_after_padding),
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -1324,16 +1325,17 @@ class NPUModelRunner310V2(NPUModelRunner):
     ):
         # TODO: Refactor 310P sampling to use Triton Dispatcher after vLLM RFC
         # #45133 lands.
-        if grammar_output is not None:
-            # TODO: Restore structured output support in the next 310P MRV2 iteration.
-            raise NotImplementedError("Structured output is not supported by model runner v2 on 310P.")
         logits = self.model.compute_logits(hidden_states[input_batch.logits_indices])
+        if grammar_output is not None:
+            apply_grammar_bitmask(logits, input_batch, grammar_output)
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             sampler_output = self.sampler(logits, input_batch)
             can_sample_np = input_batch.seq_lens_np[: input_batch.num_reqs] >= input_batch.prefill_len_np
-            # CPU penalty/bad-word history must include samples even when
-            # this batch contains no draft tokens (baseline or MTP prefill).
-            self._sampled_tokens_cpu = sampler_output.sampled_token_ids.detach().to("cpu")
+            self._sampled_tokens_cpu = None
+            # Penalties and bad words read host history. MTP also uses it
+            # to prepare the next draft, including steps with no drafts.
+            if self.speculator is not None or self.sampler.needs_cpu_token_history(input_batch.idx_mapping_np):
+                self._sampled_tokens_cpu = sampler_output.sampled_token_ids.detach().to("cpu")
             num_reqs = input_batch.num_reqs
             np.copyto(
                 self._num_sampled_staging.np[:num_reqs],
@@ -1392,7 +1394,10 @@ class NPUModelRunner310V2(NPUModelRunner):
         # Chunked-prefill rows have no sample and retain prior state.
         valid_batch_np = np.flatnonzero(self._num_sampled_cpu.numpy() > 0)
         if valid_batch_np.size:
-            all_rows_valid = sampled_tokens_cpu is None and valid_batch_np.size == self._postprocess_idx_mapping_np.size
+            # Reuse the device token for non-speculative decoding, even when
+            # penalties or bad words require a separate CPU history.
+            use_device_tokens = sampled_tokens_cpu is None or (self.speculator is None and sampled_tokens.shape[1] == 1)
+            all_rows_valid = use_device_tokens and valid_batch_np.size == self._postprocess_idx_mapping_np.size
             if all_rows_valid:
                 valid_reqs = idx_mapping.to(torch.int64)
                 last_tokens = sampled_tokens[:, 0]
@@ -1404,7 +1409,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                 valid_reqs = self._decode_req_indices.gpu[:num_valid]
                 self._decode_input_indices.copy_to_gpu(num_valid)
                 self._decode_req_indices.copy_to_gpu(num_valid)
-                if sampled_tokens_cpu is None:
+                if use_device_tokens:
                     last_tokens = sampled_tokens.index_select(0, valid_batch)[:, 0]
                 else:
                     last_tokens_cpu = torch.stack(
